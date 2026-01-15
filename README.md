@@ -1,8 +1,8 @@
 
-# Informaniak kDrive Backup Agent for Home Assistant
+# Infomaniak kDrive Backup Agent for Home Assistant
 
 ## Description
-Cette intégration permet de sauvegarder vos backups Home Assistant vers **Informaniak kDrive**.
+Cette intégration permet de sauvegarder vos backups Home Assistant vers **Infomaniak kDrive**.
 
 ## Fonctionnalités
 - Connexion avec **token API**, que vous pouvez créer à cette adresse : https://manager.infomaniak.com/v3/, puis via Mon Profil, Développeur, Tokens API, puis Créer un token en choississant le scope "Drive".
@@ -12,7 +12,7 @@ Cette intégration permet de sauvegarder vos backups Home Assistant vers **Infor
 - Rétention alignée sur Home Assistant.
 
 ## Installation
-1. Copiez le dossier `custom_components/informaniak_kdrive` dans votre configuration Home Assistant.
+1. Copiez le dossier `custom_components/infomaniak_kdrive` dans votre configuration Home Assistant.
 2. Ajoutez le logo Infomaniak (optionnel) dans `logo.png`.
 3. Redémarrez Home Assistant.
 

@@ -1,6 +1,6 @@
 {
-  "domain": "informaniak_kdrive",
-  "name": "Informaniak kDrive Backup Agent",
+  "domain": "infomaniak_kdrive",
+  "name": "Infomaniak kDrive Backup Agent",
   "version": "0.3.4",
   "documentation": "https://developer.infomaniak.com/docs/api",
   "requirements": [],
@@ -10,7 +10,7 @@
   "iot_class": "cloud_push",
   "config_flow": true,
   "loggers": [
-    "custom_components.informaniak_kdrive"
+    "custom_components.infomaniak_kdrive"
   ],
   "integration_type": "hub",
   "dependencies": [

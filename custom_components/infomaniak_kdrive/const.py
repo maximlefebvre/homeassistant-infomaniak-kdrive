@@ -2,7 +2,7 @@
 from __future__ import annotations
 import re
 
-DOMAIN = "informaniak_kdrive"
+DOMAIN = "infomaniak_kdrive"
 
 CONF_TOKEN = "token"
 CONF_DRIVE_ID = "drive_id"
@@ -12,7 +12,7 @@ CONF_FOLDER_URL = "folder_url"
 DATA_CLIENT = "client"
 DATA_BACKUP_AGENT_LISTENERS = "backup_agent_listeners"
 
-AGENT_NAME = "Informaniak kDrive"
+AGENT_NAME = "Infomaniak kDrive"
 
 ID_TAG = "__id-"
 VER_TAG = "__ver-"

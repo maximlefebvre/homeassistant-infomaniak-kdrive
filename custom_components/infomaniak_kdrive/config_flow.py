@@ -6,7 +6,7 @@ from homeassistant.helpers import config_entry_oauth2_flow
 
 from .const import DOMAIN, CONF_TOKEN, CONF_FOLDER_URL, CONF_DRIVE_ID, CONF_FOLDER_ID, parse_kdrive_folder_url
 
-class InformaniakKDriveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class InforaniakKDriveConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 5
 
     async def async_step_user(self, user_input=None):

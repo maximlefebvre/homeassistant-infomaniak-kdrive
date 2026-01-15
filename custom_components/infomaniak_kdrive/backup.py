@@ -116,7 +116,7 @@ def _get_current_ha_version(hass: HomeAssistant) -> str:
 class KDriveBackupAgent(BackupAgent):
     domain = DOMAIN
     name = AGENT_NAME
-    unique_id = "informaniak_kdrive_default"
+    unique_id = "infomaniak_kdrive_default"
 
     def __init__(self, hass: HomeAssistant, client: KDriveClient) -> None:
         self._hass = hass
