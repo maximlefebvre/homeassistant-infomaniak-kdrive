@@ -5,7 +5,7 @@
   "documentation": "https://developer.infomaniak.com/docs/api",
   "requirements": [],
   "codeowners": [
-    "@maxime"
+    "@maximlefebvre"
   ],
   "iot_class": "cloud_push",
   "config_flow": true,
