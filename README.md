@@ -19,5 +19,7 @@ This integration allows you to sync and save your Home Assistant backups directl
 - Folder URL: Enter the folder URL as shown in the example below.
 
 ## URL Example
-```https://ksuite.infomaniak.com/all/kdrive/app/drive/12345/files/67890```
+```
+https://ksuite.infomaniak.com/all/kdrive/app/drive/12345/files/67890
+```
 The integration will automatically extract `drive_id=1234` and `folder_id=67890` from this link.
