@@ -192,6 +192,7 @@ class KDriveBackupAgent(BackupAgent):
         if not match:
             raise BackupNotFound(f"No remote file for {backup_id}")
         await self._client.delete_file(match["id"])
+        await self._client.delete_file_from_trash(match["id"])
 
     async def _enforce_retention(self, retention_count: int) -> None:
         items = await self._client.list_folder_files()

@@ -57,6 +57,11 @@ class KDriveClient:
         async with self._session.delete(url, headers=self._headers) as resp:
             resp.raise_for_status()
 
+    async def delete_file_from_trash(self, file_id: int) -> None:
+        url = f"{self._base_v2}/trash/{file_id}"
+        async with self._session.delete(url, headers=self._headers) as resp:
+            resp.raise_for_status()
+
     async def download_file_stream(self, file_id: int) -> AsyncIterator[bytes]:
         url = f"{self._base_v3}/files/{file_id}/download"
         resp = await self._session.get(url, headers=self._headers)
