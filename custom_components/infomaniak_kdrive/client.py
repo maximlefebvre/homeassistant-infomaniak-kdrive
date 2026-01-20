@@ -3,9 +3,12 @@ from __future__ import annotations
 from typing import AsyncIterator, Dict, List, Optional
 import os
 import tempfile
+import asyncio
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+CHUNK_SIZE = 20 * 1024 * 1024  # 20 MiB
 
 class KDriveClient:
     def __init__(self, hass: HomeAssistant, token: Optional[str], drive_id: int, folder_id: int):
@@ -93,3 +96,30 @@ class KDriveClient:
             url = f"{self._base_v3}/upload?total_size={size_hint}&directory_id={self._folder_id}&file_name={filename}"
             async with self._session.post(url, headers=self._headers, data=await open_stream()) as resp:
                 resp.raise_for_status()
+
+    async def upload_stream_to_folder_by_chunk(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> None:
+
+      if size_hint is None:
+          raise ValueError("size_hint requis pour l'upload de fichiers volumineux")
+
+      init_url = f"{self._base_v3}/upload?total_size={size_hint}&directory_id={self._folder_id}&file_name={filename}"
+
+      async with self._session.post(init_url, headers=self._headers) as resp:
+          resp.raise_for_status()
+          result = await resp.json()
+          upload_id = result["data"]["id"]
+
+      offset = 0
+      async for chunk in await open_stream():
+          length = len(chunk)
+          chunk_url = f"{self._base_v3}/upload/{upload_id}?offset={offset}&size={length}"
+          async with self._session.post(chunk_url, headers=self._headers, data=chunk) as resp:
+              resp.raise_for_status()
+          offset += length
+
+      if offset != size_hint:
+          raise RuntimeError(
+              f"Upload incomplet: {offset}/{size_hint} octets envoyés"
+          )
+
+

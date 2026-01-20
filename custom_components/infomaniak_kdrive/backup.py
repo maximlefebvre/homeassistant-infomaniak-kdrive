@@ -22,6 +22,8 @@ from .const import (
 )
 from .client import KDriveClient
 
+CHUNK_LIMIT = 900 * 1024 * 1024  # 900 MiB
+
 async def async_get_backup_agents(hass: HomeAssistant) -> list[BackupAgent]:
     if DOMAIN not in hass.data or DATA_CLIENT not in hass.data[DOMAIN]:
         return []
@@ -131,11 +133,11 @@ class KDriveBackupAgent(BackupAgent):
     ) -> None:
         filename = make_filename(backup)
         size_hint = getattr(backup, "size", None)
-        await self._client.upload_stream_to_folder(
-            filename=filename,
-            open_stream=open_stream,
-            size_hint=size_hint,
-        )
+        if(size_hint<CHUNK_LIMIT):
+          await self._client.upload_stream_to_folder(filename=filename, open_stream=open_stream, size_hint=size_hint)
+        else: 
+          await self._client.upload_stream_to_folder_by_chunk(filename=filename, open_stream=open_stream, size_hint=size_hint)
+        
         retention = _get_ha_retention_count(self._hass)
         if retention is not None and retention > 0:
             await self._enforce_retention(retention)
