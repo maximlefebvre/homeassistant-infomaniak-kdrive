@@ -1,7 +1,7 @@
 {
   "domain": "infomaniak_kdrive",
   "name": "Infomaniak kDrive Backup Agent",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "documentation": "https://developer.infomaniak.com/docs/api",
   "requirements": [],
   "codeowners": [

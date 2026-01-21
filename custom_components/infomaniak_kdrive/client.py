@@ -4,6 +4,10 @@ from typing import AsyncIterator, Dict, List, Optional
 import os
 import tempfile
 import asyncio
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+_LOGGER = logging.getLogger(__name__)
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -110,16 +114,44 @@ class KDriveClient:
           upload_id = result["data"]["id"]
 
       offset = 0
-      async for chunk in await open_stream():
-          length = len(chunk)
-          chunk_url = f"{self._base_v3}/upload/{upload_id}?offset={offset}&size={length}"
-          async with self._session.post(chunk_url, headers=self._headers, data=chunk) as resp:
-              resp.raise_for_status()
-          offset += length
+      # On récupère le nombre de chunks si possible pour le suivi
+      chunk_count = 0
 
-      if offset != size_hint:
-          raise RuntimeError(
-              f"Upload incomplet: {offset}/{size_hint} octets envoyés"
-          )
+      _LOGGER.info(f"Démarrage de l'upload. Taille totale prévue : {size_hint} octets")
+
+      try:
+          async for chunk in await open_stream():
+              chunk_count += 1
+              length = len(chunk)
+              
+              # Log de progression (DEBUG pour éviter de saturer les logs si beaucoup de chunks)
+              _LOGGER.debug(f"Envoi du chunk {chunk_count} | Offset: {offset} | Taille: {length}")
+              
+              chunk_url = f"{self._base_v3}/upload/{upload_id}?offset={offset}&size={length}"
+              
+              async with self._session.post(chunk_url, headers=self._headers, data=chunk) as resp:
+                  if resp.status != 200:
+                      _LOGGER.error(f"Erreur lors de l'envoi du chunk {chunk_count} : HTTP {resp.status}")
+                  resp.raise_for_status()
+                  
+              offset += length
+              
+              # Log de progression tous les 5 chunks pour avoir un suivi visuel en INFO
+              if chunk_count % 5 == 0:
+                  percent = (offset / size_hint) * 100 if size_hint > 0 else 0
+                  _LOGGER.info(f"Progression upload : {percent:.1f}% ({offset}/{size_hint} bytes)")
+
+          # Vérification finale
+          if offset != size_hint:
+              _LOGGER.critical(f"Échec de l'intégrité : {offset} octets envoyés sur {size_hint} attendus")
+              raise RuntimeError(
+                  f"Upload incomplet: {offset}/{size_hint} octets envoyés"
+              )
+          
+          _LOGGER.info(f"Upload terminé avec succès ! {chunk_count} chunks envoyés au total.")
+
+      except Exception as e:
+          _LOGGER.exception(f"Erreur inattendue durant l'upload de BackupAgent : {str(e)}")
+          raise
 
 
