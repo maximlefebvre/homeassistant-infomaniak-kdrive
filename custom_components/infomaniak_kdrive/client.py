@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+import math
 from typing import AsyncIterator, Dict, List, Optional
 import os
 import tempfile
@@ -11,8 +12,6 @@ _LOGGER = logging.getLogger(__name__)
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-
-CHUNK_SIZE = 20 * 1024 * 1024  # 20 MiB
 
 class KDriveClient:
     def __init__(self, hass: HomeAssistant, token: Optional[str], drive_id: int, folder_id: int):
@@ -77,81 +76,156 @@ class KDriveClient:
             yield chunk
 
     async def upload_stream_to_folder(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> None:
-        if size_hint is None:
-            tmp_fd, tmp_path = tempfile.mkstemp(prefix="ha-kdrive-", suffix=".tar")
-            os.close(tmp_fd)
-            try:
-                async def _write_tmp():
-                    async for chunk in await open_stream():
-                        with open(tmp_path, "ab") as f:
-                            f.write(chunk)
-                await _write_tmp()
+        chunk_size = 512 * 1024 * 1024
+        ONE_GIB = 1024 * 1024 * 1024
+        tmp_path = None
+        session_token = None
+
+        try:
+            # ------------------------------------------------------------------
+            # 1) Determine the total size
+            # ------------------------------------------------------------------
+            if size_hint is None:
+                fd, tmp_path = tempfile.mkstemp(prefix="ha-kdrive-", suffix=".tar")
+                os.close(fd)
+
+                async for chunk in await open_stream():
+                    with open(tmp_path, "ab") as f:
+                        f.write(chunk)
+
                 total_size = os.path.getsize(tmp_path)
+            else:
+                total_size = size_hint
+
+            # ------------------------------------------------------------------
+            # 2) Direct upload if <= 1 Go
+            # ------------------------------------------------------------------
+            if total_size <= ONE_GIB:
                 url = f"{self._base_v3}/upload?total_size={total_size}&directory_id={self._folder_id}&file_name={filename}"
-                with open(tmp_path, "rb") as f:
-                    async with self._session.post(url, headers=self._headers, data=f) as resp:
+                if tmp_path:
+                    with open(tmp_path, "rb") as f:
+                        async with self._session.post(
+                            url, headers=self._headers, data=f
+                        ) as resp:
+                            resp.raise_for_status()
+                else:
+                    async with self._session.post(
+                        url,
+                        headers=self._headers,
+                        data=await open_stream(),
+                    ) as resp:
                         resp.raise_for_status()
-            finally:
+
+                return
+
+            # ------------------------------------------------------------------
+            # 3) Chunk if > 1 Go, start session
+            # ------------------------------------------------------------------
+            start_url = f"{self._base_v3}/upload/session/start"
+            start_payload = {
+                "directory_id": self._folder_id,
+                "file_name": filename,
+                "total_size": total_size,
+            }
+
+            async with self._session.post(
+                start_url,
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=start_payload,
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+            session_token = (
+                data.get("data", {}).get("session_token")
+                or data.get("session_token")
+            )
+            if not session_token:
+                raise RuntimeError("Session token manquant")
+
+            # ------------------------------------------------------------------
+            # 4) Send the chunks
+            # ------------------------------------------------------------------
+            upload_url = f"{self._base_v3}/upload/session/{session_token}/chunk"
+            offset = 0
+
+            async def chunk_iter():
+                if tmp_path:
+                    with open(tmp_path, "rb") as f:
+                        while True:
+                            buf = f.read(chunk_size)
+                            if not buf:
+                                break
+                            yield buf
+                else:
+                    buffer = bytearray()
+                    async for part in await open_stream():
+                        buffer.extend(part)
+                        while len(buffer) >= chunk_size:
+                            yield bytes(buffer[:chunk_size])
+                            del buffer[:chunk_size]
+                    if buffer:
+                        yield bytes(buffer)
+
+            async for chunk in chunk_iter():
+                end = offset + len(chunk) - 1
+                headers = {
+                    **self._headers,
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"bytes {offset}-{end}/{total_size}",
+                }
+
+                async with self._session.post(
+                    upload_url,
+                    headers=headers,
+                    data=chunk,
+                ) as resp:
+                    resp.raise_for_status()
+
+                offset += len(chunk)
+
+            if offset != total_size:
+                raise RuntimeError("Upload incomplet")
+
+            # ------------------------------------------------------------------
+            # 5) Close the session
+            # ------------------------------------------------------------------
+            finish_url = (
+                f"{self._base_v3}/upload/session/{session_token}/finish"
+            )
+            finish_payload = {
+                "directory_id": self._folder_id,
+                "file_name": filename,
+            }
+
+            async with self._session.post(
+                finish_url,
+                headers={**self._headers, "Content-Type": "application/json"},
+                json=finish_payload,
+            ) as resp:
+                resp.raise_for_status()
+
+        except Exception:
+            # ------------------------------------------------------------------
+            # 6) If error, cancel the session
+            # ------------------------------------------------------------------
+            if session_token:
+                cancel_url = (
+                    f"{self._base_v3.replace('/3/', '/2/')}"
+                    f"/upload/session/{session_token}"
+                )
+                try:
+                    async with self._session.delete(
+                        cancel_url, headers=self._headers
+                    ):
+                        pass
+                except Exception:
+                    pass
+            raise
+
+        finally:
+            if tmp_path:
                 try:
                     os.remove(tmp_path)
                 except OSError:
                     pass
-        else:
-            url = f"{self._base_v3}/upload?total_size={size_hint}&directory_id={self._folder_id}&file_name={filename}"
-            async with self._session.post(url, headers=self._headers, data=await open_stream()) as resp:
-                resp.raise_for_status()
-
-    async def upload_stream_to_folder_by_chunk(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> None:
-
-      if size_hint is None:
-          raise ValueError("size_hint requis pour l'upload de fichiers volumineux")
-
-      init_url = f"{self._base_v3}/upload?total_size={size_hint}&directory_id={self._folder_id}&file_name={filename}"
-
-      async with self._session.post(init_url, headers=self._headers) as resp:
-          resp.raise_for_status()
-          result = await resp.json()
-          upload_id = result["data"]["id"]
-
-      offset = 0
-      # On récupère le nombre de chunks si possible pour le suivi
-      chunk_count = 0
-
-      _LOGGER.info(f"Démarrage de l'upload. Taille totale prévue : {size_hint} octets")
-
-      try:
-          async for chunk in await open_stream():
-              chunk_count += 1
-              length = len(chunk)
-              
-              # Log de progression (DEBUG pour éviter de saturer les logs si beaucoup de chunks)
-              _LOGGER.debug(f"Envoi du chunk {chunk_count} | Offset: {offset} | Taille: {length}")
-              
-              chunk_url = f"{self._base_v3}/upload/{upload_id}?offset={offset}&size={length}"
-              
-              async with self._session.post(chunk_url, headers=self._headers, data=chunk) as resp:
-                  if resp.status != 200:
-                      _LOGGER.error(f"Erreur lors de l'envoi du chunk {chunk_count} : HTTP {resp.status}")
-                  resp.raise_for_status()
-                  
-              offset += length
-              
-              # Log de progression tous les 5 chunks pour avoir un suivi visuel en INFO
-              if chunk_count % 5 == 0:
-                  percent = (offset / size_hint) * 100 if size_hint > 0 else 0
-                  _LOGGER.info(f"Progression upload : {percent:.1f}% ({offset}/{size_hint} bytes)")
-
-          # Vérification finale
-          if offset != size_hint:
-              _LOGGER.critical(f"Échec de l'intégrité : {offset} octets envoyés sur {size_hint} attendus")
-              raise RuntimeError(
-                  f"Upload incomplet: {offset}/{size_hint} octets envoyés"
-              )
-          
-          _LOGGER.info(f"Upload terminé avec succès ! {chunk_count} chunks envoyés au total.")
-
-      except Exception as e:
-          _LOGGER.exception(f"Erreur inattendue durant l'upload de BackupAgent : {str(e)}")
-          raise
-
-
