@@ -23,20 +23,3 @@ This integration allows you to sync and save your Home Assistant backups directl
 https://ksuite.infomaniak.com/all/kdrive/app/drive/12345/files/67890
 ```
 The integration will automatically extract `drive_id=1234` and `folder_id=67890` from this link.
-
-
-Hi,
-
-Google Drive, Microsoft OneDrive, ... are great solutions to externalise backup of Home Assistant and be sure to be reliable if your device has an issue. But I'm using Infomaniak kSuite, so I was a bit frustrated to do not have my backup on the same place than my usual files.
-
-I have started to develop an integration to let my kDrive becoming my external emplacement for my Home Assistant backup, based on the API.
-
-It could be used with HACS and this GitHub repo : https://github.com/maximlefebvre/homeassistant-infomaniak-kdrive
-
-This is not perfect, I still need :
-
-* To support files larger than 1GB
-* To delete the delete file in the Trash too, to limit the space used
-* To change the code to make more Home Assistant, with the usage of PyPI
-
-And if it could 

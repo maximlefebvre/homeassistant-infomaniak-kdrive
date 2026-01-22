@@ -22,8 +22,6 @@ from .const import (
 )
 from .client import KDriveClient
 
-CHUNK_LIMIT = 900 * 1024 * 1024  # 900 MiB
-
 async def async_get_backup_agents(hass: HomeAssistant) -> list[BackupAgent]:
     if DOMAIN not in hass.data or DATA_CLIENT not in hass.data[DOMAIN]:
         return []
