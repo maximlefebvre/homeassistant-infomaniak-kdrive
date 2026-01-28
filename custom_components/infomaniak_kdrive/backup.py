@@ -122,20 +122,10 @@ class KDriveBackupAgent(BackupAgent):
         self._hass = hass
         self._client = client
 
-    async def async_upload_backup(
-        self,
-        *,
-        open_stream: Callable[[], Coroutine[Any, Any, AsyncIterator[bytes]]],
-        backup: AgentBackup,
-        **kwargs: Any,
-    ) -> None:
+    async def async_upload_backup(self, *, open_stream: Callable[[], Coroutine[Any, Any, AsyncIterator[bytes]]], backup: AgentBackup, **kwargs: Any) -> None:
         filename = make_filename(backup)
         size_hint = getattr(backup, "size", None)
-        if(size_hint<CHUNK_LIMIT):
-          await self._client.upload_stream_to_folder(filename=filename, open_stream=open_stream, size_hint=size_hint)
-        else: 
-          await self._client.upload_stream_to_folder_by_chunk(filename=filename, open_stream=open_stream, size_hint=size_hint)
-        
+        await self._client.upload_stream_to_folder(filename=filename, open_stream=open_stream, size_hint=size_hint)
         retention = _get_ha_retention_count(self._hass)
         if retention is not None and retention > 0:
             await self._enforce_retention(retention)
