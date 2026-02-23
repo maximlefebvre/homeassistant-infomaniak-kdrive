@@ -80,6 +80,7 @@ class KDriveClient:
         ONE_GIB = 900 * 1024 * 1024 # 900 MiB
         chunk_size = 5 * 1024 * 1024  # 5 MiB
         session_token = None
+        tmp_path = None
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True)) as upload_session:
 
             # ------------------------------------------------------------------
