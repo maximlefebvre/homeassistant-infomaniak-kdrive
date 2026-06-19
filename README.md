@@ -4,7 +4,7 @@
 This integration allows you to sync and save your Home Assistant backups directly to Infomaniak kDrive.
 
 ## Features
-- API Token Connection: Create your token at https://manager.infomaniak.com/v3/ by navigating to My Profile > Developer > API Tokens, then Create a token with the "Drive" scope selected.
+- API Token Connection: Create your token at https://manager.infomaniak.com/v3/ng/profile/user/token/list, then Create a token with the "Drive" scope selected.
 - Simplified Input: Simply paste the full kDrive folder URL (e.g., https://ksuite.infomaniak.com/all/kdrive/app/drive/12345/files/67890).
 - Enriched Filenames: Backups are saved as suggested_filename__id-<backup_id>__ver-<ha_version>__prot-<true|false>.tar.
 - Accurate Sizing: Real file size verification via HEAD/GET requests.
