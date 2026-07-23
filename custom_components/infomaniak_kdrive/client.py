@@ -14,6 +14,10 @@ import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
+# Désactiver le timeout total pour les uploads (ou mettre une valeur très haute)
+# tout en gardant un timeout raisonnable pour la connexion initiale.
+upload_timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
+
 class KDriveClient:
     def __init__(self, hass: HomeAssistant, token: Optional[str], drive_id: int, folder_id: int):
         self._hass = hass
@@ -97,7 +101,7 @@ class KDriveClient:
                 # ------------------------------------------------------------------
                 if total_size <= ONE_GIB:
                     url = f"{self._base_v3}/upload?total_size={total_size}&directory_id={self._folder_id}&file_name={filename}"
-                    async with upload_session.post(url, headers=self._headers, data=await open_stream()
+                    async with upload_session.post(url, headers=self._headers, data=await open_stream(), timeout=upload_timeout
                     ) as resp:
                         resp.raise_for_status()
 
