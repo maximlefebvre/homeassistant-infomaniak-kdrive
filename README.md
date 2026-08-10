@@ -6,9 +6,16 @@ This integration allows you to sync and save your Home Assistant backups directl
 ## Features
 - API Token Connection (no need of WebDAV): 
 - Simplified Input: Simply paste the full kDrive folder URL (e.g., https://ksuite.infomaniak.com/02468/kdrive/app/drive/12345/files/67890).
-- Enriched Filenames: Backups are saved as suggested_filename__id-<backup_id>__ver-<ha_version>__prot-<true|false>.tar.
-- Accurate Sizing: Real file size verification via HEAD/GET requests.
-- Retention Policy: Retention settings are aligned with your Home Assistant configuration.
+- Full Metadata: Each backup is stored as two files — the archive `suggested_filename__id-<backup_id>.tar` and a small sidecar `<backup_id>.metadata.json` holding the complete Home Assistant metadata (date, folders, add-ons, encryption, size…).
+- Accurate Sizing: Size comes from the sidecar; older backups still fall back to HEAD/GET verification.
+- Retention Policy: Retention settings are aligned with your Home Assistant configuration, oldest backups first.
+
+## Upgrading from 0.5.x
+Backups made with earlier versions stored their metadata inside the filename
+(`…__id-<id>__ver-<version>__prot-<true|false>.tar`). They keep working: they are
+still listed, downloadable and restorable, and a sidecar is written for them
+automatically in the background the first time the backup list is opened.
+No existing file is ever renamed or deleted during that migration.
 
 ## Installation
 1. Add the following custom repositories into HACS, in selecting Integration as type : https://github.com/maximlefebvre/homeassistant-infomaniak-kdrive

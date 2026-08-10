@@ -14,9 +14,17 @@ DATA_BACKUP_AGENT_LISTENERS = "backup_agent_listeners"
 
 AGENT_NAME = "Infomaniak kDrive"
 
+# Marqueurs encodés dans le nom de l'archive.
+# ID_TAG est toujours écrit (filet de sécurité si le sidecar est perdu).
+# VER_TAG / PROT_TAG ne sont plus écrits depuis 0.6.0 mais restent lus pour
+# les archives créées par les versions précédentes.
 ID_TAG = "__id-"
 VER_TAG = "__ver-"
 PROT_TAG = "__prot-"
+
+# Sidecar de métadonnées: un fichier <backup_id>.metadata.json par archive.
+SIDECAR_SUFFIX = ".metadata.json"
+METADATA_VERSION = 1
 
 OAUTH2_AUTHORIZE = "https://login.infomaniak.com/authorize"
 OAUTH2_TOKEN = "https://login.infomaniak.com/token"

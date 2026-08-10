@@ -18,6 +18,19 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 # tout en gardant un timeout raisonnable pour la connexion initiale.
 upload_timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
 
+def _extract_file_id(payload) -> Optional[int]:
+    """Lit l'id du fichier dans une réponse d'upload, sans jamais lever."""
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if not isinstance(data, dict):
+        return None
+    file_id = data.get("id")
+    return file_id if isinstance(file_id, int) else None
+
+
 class KDriveClient:
     def __init__(self, hass: HomeAssistant, token: Optional[str], drive_id: int, folder_id: int):
         self._hass = hass
@@ -36,6 +49,31 @@ class KDriveClient:
             data = await resp.json()
             items = data.get("data", [])
             return [it for it in items if it.get("type") == "file"]
+
+    async def upload_bytes(self, *, filename: str, data: bytes) -> Optional[int]:
+        """Upload a small in-memory payload (used for the backup metadata sidecars).
+
+        Returns the id of the created file, or None if the API did not report it.
+        """
+        url = f"{self._base_v3}/upload"
+        params = {
+            "total_size": str(len(data)),
+            "directory_id": str(self._folder_id),
+            "file_name": filename,
+        }
+        async with self._session.post(url, headers=self._headers, params=params, data=data) as resp:
+            resp.raise_for_status()
+            try:
+                payload = await resp.json()
+            except Exception:
+                return None
+        return _extract_file_id(payload)
+
+    async def download_file_bytes(self, file_id: int) -> bytes:
+        url = f"{self._base_v3}/files/{file_id}/download"
+        async with self._session.get(url, headers=self._headers) as resp:
+            resp.raise_for_status()
+            return await resp.read()
 
     async def get_file_size(self, file_id: int) -> int:
         url = f"{self._base_v3}/files/{file_id}/download"
@@ -80,11 +118,13 @@ class KDriveClient:
         async for chunk in resp.content.iter_chunked(64 * 1024):
             yield chunk
 
-    async def upload_stream_to_folder(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> None:
+    async def upload_stream_to_folder(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> Optional[int]:
+        """Upload the backup archive. Returns the id of the created file if known."""
         ONE_GIB = 900 * 1024 * 1024 # 900 MiB
         chunk_size = 5 * 1024 * 1024  # 5 MiB
         session_token = None
         tmp_path = None
+        uploaded_id: Optional[int] = None
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=True)) as upload_session:
 
             # ------------------------------------------------------------------
@@ -100,10 +140,20 @@ class KDriveClient:
                 # 2a) Direct upload if <= 1 Go (900 MiB in reality)
                 # ------------------------------------------------------------------
                 if total_size <= ONE_GIB:
-                    url = f"{self._base_v3}/upload?total_size={total_size}&directory_id={self._folder_id}&file_name={filename}"
-                    async with upload_session.post(url, headers=self._headers, data=await open_stream(), timeout=upload_timeout
+                    url = f"{self._base_v3}/upload"
+                    params = {
+                        "total_size": str(total_size),
+                        "directory_id": str(self._folder_id),
+                        "file_name": filename,
+                    }
+                    async with upload_session.post(url, headers=self._headers, params=params, data=await open_stream(), timeout=upload_timeout
                     ) as resp:
                         resp.raise_for_status()
+                        try:
+                            data = await resp.json()
+                        except Exception:
+                            data = {}
+                    uploaded_id = _extract_file_id(data)
 
                 # ------------------------------------------------------------------
                 # 2b) Chunked upload if > 1 Go (900 MiB in reality)
@@ -180,9 +230,10 @@ class KDriveClient:
                         "total_chunk_hash": f"sha256:{sha256_file.hexdigest()}",
                     }
                     async with upload_session.post(url, headers=self._headers, params=params,
-                    ) as resp: 
+                    ) as resp:
                        resp.raise_for_status()
                        data = await resp.json()
+                    uploaded_id = _extract_file_id(data)
 
             # --- CANCEL THE SESSION --- #
             except Exception:
@@ -204,3 +255,5 @@ class KDriveClient:
                         os.remove(tmp_path)
                     except OSError:
                         pass
+
+            return uploaded_id

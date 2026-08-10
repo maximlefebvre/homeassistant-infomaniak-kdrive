@@ -1,5 +1,10 @@
 
 from __future__ import annotations
+import asyncio
+import json
+import logging
+import re
+from datetime import datetime
 from typing import Any, AsyncIterator, Callable, Coroutine, List, Dict
 
 from homeassistant.core import HomeAssistant, callback
@@ -10,6 +15,7 @@ from homeassistant.components.backup import (
 )
 from homeassistant.components.backup.util import suggested_filename_from_name_date
 from homeassistant.components.backup.const import DATA_MANAGER
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DOMAIN,
@@ -19,8 +25,12 @@ from .const import (
     ID_TAG,
     VER_TAG,
     PROT_TAG,
+    SIDECAR_SUFFIX,
+    METADATA_VERSION,
 )
 from .client import KDriveClient
+
+_LOGGER = logging.getLogger(__name__)
 
 async def async_get_backup_agents(hass: HomeAssistant) -> list[BackupAgent]:
     if DOMAIN not in hass.data or DATA_CLIENT not in hass.data[DOMAIN]:
@@ -40,15 +50,28 @@ def async_register_backup_agents_listener(hass: HomeAssistant, *, listener: Call
 # Helpers
 
 def make_filename(backup: AgentBackup) -> str:
+    """Nom de l'archive: <suggested_filename>__id-<backup_id>.tar
+
+    Toutes les métadonnées vivent dans le sidecar. Le backup_id reste dans le
+    nom comme filet de sécurité: si le sidecar est perdu ou illisible, l'archive
+    reste identifiable, listable et supprimable.
+    """
     base = suggested_filename_from_name_date(backup.name, backup.date)
-    ver = getattr(backup, "homeassistant_version", "") or "unknown"
-    prot = "true" if getattr(backup, "protected", False) else "false"
     stem = base[:-4] if base.endswith('.tar') else base
-    return f"{stem}{ID_TAG}{backup.backup_id}{VER_TAG}{ver}{PROT_TAG}{prot}.tar"
+    return f"{stem}{ID_TAG}{backup.backup_id}.tar"
+
+
+def sidecar_filename(backup_id: str) -> str:
+    return f"{backup_id}{SIDECAR_SUFFIX}"
 
 
 def try_parse_filename(name: str) -> dict | None:
-    # Forme attendue (ordre stable): <suggested>__id-<id>__ver-<ver>__prot-<true|false>.tar
+    """Lit les métadonnées encodées dans le nom d'une archive.
+
+    Tolère les deux formes:
+      - 0.6+   : <suggested>__id-<id>.tar
+      - <= 0.5 : <suggested>__id-<id>__ver-<ver>__prot-<true|false>.tar
+    """
     if not name.endswith('.tar'):
         return None
     stem = name[:-4]
@@ -68,6 +91,38 @@ def try_parse_filename(name: str) -> dict | None:
     if not meta["backup_id"]:
         return None
     return meta
+
+
+# suggested_filename_from_name_date() produit "<nom> <date:%Y-%m-%d %H.%M %S%f>"
+# avec les espaces remplacés par des '_'. La date reste donc récupérable.
+LEGACY_NAME_DATE_RE = re.compile(
+    r"^(?P<name>.+)_(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})"
+    r"_(?P<H>\d{2})\.(?P<M>\d{2})_(?P<S>\d{2})(?P<us>\d{6})$"
+)
+
+
+def recover_name_and_date(name_hint: str, item: dict) -> tuple[str, str]:
+    """Reconstruit (nom lisible, date ISO) pour une archive sans sidecar."""
+    if m := LEGACY_NAME_DATE_RE.match(name_hint):
+        try:
+            # Le nom a été généré en heure locale de l'instance.
+            when = datetime(
+                int(m["y"]), int(m["mo"]), int(m["d"]),
+                int(m["H"]), int(m["M"]), int(m["S"]), int(m["us"]),
+                tzinfo=dt_util.DEFAULT_TIME_ZONE,
+            )
+            return m["name"].replace('_', ' '), when.isoformat()
+        except ValueError:
+            pass
+    # Secours: la date de création côté kDrive (~ l'heure de l'upload).
+    for key in ("created_at", "added_at", "last_modified_at"):
+        raw = item.get(key)
+        if raw:
+            try:
+                return name_hint.replace('_', ' '), dt_util.utc_from_timestamp(int(raw)).isoformat()
+            except (TypeError, ValueError):
+                continue
+    return name_hint.replace('_', ' '), dt_util.utcnow().isoformat()
 
 
 def _get_ha_retention_count(hass: HomeAssistant) -> int | None:
@@ -121,81 +176,265 @@ class KDriveBackupAgent(BackupAgent):
     def __init__(self, hass: HomeAssistant, client: KDriveClient) -> None:
         self._hass = hass
         self._client = client
+        # file_id -> (marqueur de révision, payload) : évite de retélécharger les
+        # sidecars à chaque listing (HA appelle async_list_backups souvent).
+        self._sidecar_cache: dict[int, tuple[tuple, dict]] = {}
+        self._backfilled: set[str] = set()
+        self._backfill_task: asyncio.Task | None = None
+
+    # --- Sidecar I/O ---------------------------------------------------
+
+    async def _read_sidecar(self, item: dict) -> dict | None:
+        file_id = item.get("id")
+        marker = (item.get("last_modified_at"), item.get("size"))
+        cached = self._sidecar_cache.get(file_id)
+        if cached and cached[0] == marker:
+            return cached[1]
+        try:
+            raw = await self._client.download_file_bytes(file_id)
+            payload = json.loads(raw)
+        except Exception:
+            _LOGGER.warning("Unreadable backup metadata sidecar: %s", item.get("name"))
+            return None
+        if not isinstance(payload, dict) or not isinstance(payload.get("backup"), dict):
+            _LOGGER.warning("Malformed backup metadata sidecar: %s", item.get("name"))
+            return None
+        self._sidecar_cache[file_id] = (marker, payload)
+        return payload
+
+    async def _write_sidecar(
+        self,
+        backup: AgentBackup,
+        *,
+        archive_name: str,
+        archive_file_id: int | None,
+        migrated: bool = False,
+        replaces: dict | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "metadata_version": METADATA_VERSION,
+            "backup_id": backup.backup_id,
+            "archive_name": archive_name,
+            "archive_file_id": archive_file_id,
+            "backup": backup.as_dict(),
+        }
+        if migrated:
+            payload["migrated_from"] = "filename"
+        # kDrive refuse (ou renomme) un fichier existant: on retire l'ancien
+        # sidecar avant de réécrire. Cas rare, uniquement lors d'un backfill.
+        if replaces:
+            self._sidecar_cache.pop(replaces.get("id"), None)
+            try:
+                await self._client.delete_file(replaces["id"])
+            except Exception:
+                _LOGGER.debug("Could not remove previous sidecar %s", replaces.get("name"))
+        await self._client.upload_bytes(
+            filename=sidecar_filename(backup.backup_id),
+            data=json.dumps(payload).encode("utf-8"),
+        )
+
+    # --- Index ---------------------------------------------------------
+
+    async def _build_index(self) -> dict[str, dict]:
+        """backup_id -> {backup, archive_item, sidecar_item, legacy}.
+
+        Deux sources, dans cet ordre de priorité:
+          1. les sidecars .metadata.json (source de vérité);
+          2. les archives .tar sans sidecar, dont les métadonnées sont relues
+             depuis le nom (backups créés avant 0.6.0).
+        """
+        items = await self._client.list_folder_files()
+        by_name = {it.get("name", ""): it for it in items}
+        by_id = {it.get("id"): it for it in items}
+        sidecar_items = [it for it in items if it.get("name", "").endswith(SIDECAR_SUFFIX)]
+
+        sem = asyncio.Semaphore(5)
+
+        async def _load(it: dict) -> tuple[dict, dict | None]:
+            async with sem:
+                return it, await self._read_sidecar(it)
+
+        index: dict[str, dict] = {}
+        for sidecar_item, payload in await asyncio.gather(*(_load(it) for it in sidecar_items)):
+            if not payload:
+                continue
+            try:
+                backup = AgentBackup.from_dict(payload["backup"])
+            except Exception:
+                _LOGGER.warning("Ignoring unusable sidecar %s", sidecar_item.get("name"), exc_info=True)
+                continue
+            archive_item = by_id.get(payload.get("archive_file_id"))
+            if archive_item is None:
+                archive_item = by_name.get(payload.get("archive_name") or "")
+            if archive_item is None:
+                archive_item = self._find_archive_by_id(items, backup.backup_id)
+            if archive_item is None:
+                # Sidecar orphelin: on ne l'expose pas (backup non restaurable)
+                # et on ne le supprime pas non plus, le listing pouvant être partiel.
+                _LOGGER.warning(
+                    "Backup metadata found without its archive, ignoring: %s", sidecar_item.get("name")
+                )
+                continue
+            index[backup.backup_id] = {
+                "backup": backup,
+                "archive_item": archive_item,
+                "sidecar_item": sidecar_item,
+                "legacy": False,
+            }
+
+        pending_backfill: list[tuple[dict, AgentBackup]] = []
+        for it in items:
+            meta = try_parse_filename(it.get("name", ""))
+            if not meta or meta["backup_id"] in index:
+                continue
+            backup = await self._legacy_backup(it, meta)
+            index[backup.backup_id] = {
+                "backup": backup,
+                "archive_item": it,
+                "sidecar_item": None,
+                "legacy": True,
+            }
+            if backup.backup_id not in self._backfilled:
+                pending_backfill.append((it, backup))
+
+        if pending_backfill:
+            self._schedule_backfill(pending_backfill)
+        return index
+
+    @staticmethod
+    def _find_archive_by_id(items: list[dict], backup_id: str) -> dict | None:
+        tag = f"{ID_TAG}{backup_id}"
+        return next(
+            (it for it in items if tag in it.get("name", "") and it.get("name", "").endswith('.tar')),
+            None,
+        )
+
+    async def _legacy_backup(self, item: dict, meta: dict) -> AgentBackup:
+        """AgentBackup reconstruit depuis le nom, pour les archives d'avant 0.6.0."""
+        size_val = item.get("size")
+        if size_val is None:
+            try:
+                size_val = await self._client.get_file_size(item["id"])
+            except Exception:
+                size_val = 0
+        name, date = recover_name_and_date(meta["name_hint"], item)
+        return AgentBackup(
+            backup_id=meta["backup_id"],
+            name=name,
+            date=date,
+            folders=[],
+            homeassistant_included=True,
+            homeassistant_version=meta.get("version") or _get_current_ha_version(self._hass),
+            protected=bool(meta.get("protected")),
+            size=int(size_val or 0),
+            database_included=True,
+            addons=[],
+            extra_metadata={},
+        )
+
+    # --- Backfill ------------------------------------------------------
+
+    def _schedule_backfill(self, pending: list[tuple[dict, AgentBackup]]) -> None:
+        if self._backfill_task and not self._backfill_task.done():
+            return
+        self._backfill_task = self._hass.async_create_background_task(
+            self._run_backfill(pending), "infomaniak_kdrive_metadata_backfill"
+        )
+
+    async def _run_backfill(self, pending: list[tuple[dict, AgentBackup]]) -> None:
+        """Écrit un sidecar pour les archives qui n'en ont pas encore.
+
+        Best-effort et idempotent: en cas d'échec, le fallback sur le nom de
+        fichier reste en place et on retentera au prochain listing.
+        """
+        for item, backup in pending:
+            if backup.backup_id in self._backfilled:
+                continue
+            try:
+                await self._write_sidecar(
+                    backup,
+                    archive_name=item.get("name", ""),
+                    archive_file_id=item.get("id"),
+                    migrated=True,
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Could not write metadata sidecar for backup %s", backup.backup_id, exc_info=True
+                )
+                continue
+            self._backfilled.add(backup.backup_id)
+            _LOGGER.info("Migrated metadata of backup %s to a sidecar file", backup.backup_id)
+
+    # --- BackupAgent ---------------------------------------------------
 
     async def async_upload_backup(self, *, open_stream: Callable[[], Coroutine[Any, Any, AsyncIterator[bytes]]], backup: AgentBackup, **kwargs: Any) -> None:
         filename = make_filename(backup)
         size_hint = getattr(backup, "size", None)
-        await self._client.upload_stream_to_folder(filename=filename, open_stream=open_stream, size_hint=size_hint)
+        # L'archive d'abord: un sidecar sans archive créerait un backup fantôme,
+        # alors qu'une archive sans sidecar reste lisible via son nom.
+        file_id = await self._client.upload_stream_to_folder(
+            filename=filename, open_stream=open_stream, size_hint=size_hint
+        )
+        try:
+            await self._write_sidecar(backup, archive_name=filename, archive_file_id=file_id)
+        except Exception:
+            _LOGGER.exception(
+                "Backup %s uploaded but its metadata sidecar could not be written", backup.backup_id
+            )
         retention = _get_ha_retention_count(self._hass)
         if retention is not None and retention > 0:
             await self._enforce_retention(retention)
 
     async def async_list_backups(self, **kwargs: Any) -> list[AgentBackup]:
-        items = await self._client.list_folder_files()
-        backups: list[AgentBackup] = []
-        default_version = _get_current_ha_version(self._hass)
-        for it in items:
-            name = it.get("name", "")
-            meta = try_parse_filename(name)
-            if not meta:
-                continue
-            size_val = it.get("size")
-            if size_val is None:
-                try:
-                    size_val = await self._client.get_file_size(it["id"])
-                except Exception:
-                    size_val = 0
-            backups.append(
-                AgentBackup(
-                    backup_id=meta["backup_id"],
-                    name=meta["name_hint"],
-                    date=None,
-                    folders=[],
-                    homeassistant_included=True,
-                    homeassistant_version=meta.get("version") or default_version,
-                    protected=bool(meta.get("protected", False)),
-                    size=int(size_val or 0),
-                    database_included=True,
-                    addons=[],
-                    extra_metadata={"source": "kdrive"},
-                )
-            )
-        return backups
+        index = await self._build_index()
+        return [entry["backup"] for entry in index.values()]
 
     async def async_get_backup(self, backup_id: str, **kwargs: Any) -> AgentBackup:
-        for b in await self.async_list_backups():
-            if b.backup_id == backup_id:
-                return b
-        raise BackupNotFound(f"Backup not found: {backup_id}")
+        entry = (await self._build_index()).get(backup_id)
+        if not entry:
+            raise BackupNotFound(f"Backup not found: {backup_id}")
+        return entry["backup"]
 
     async def async_download_backup(self, backup_id: str, **kwargs: Any) -> AsyncIterator[bytes]:
-        items = await self._client.list_folder_files()
-        # Le nom contient toujours __id-<id>
-        match = next((it for it in items if f"__id-{backup_id}" in it.get("name", "") and it.get("name", "").endswith('.tar')), None)
-        if not match:
+        entry = (await self._build_index()).get(backup_id)
+        if not entry:
             raise BackupNotFound(f"Archive not found for {backup_id}")
-        return await self._client.download_file_stream(match["id"])
+        return await self._client.download_file_stream(entry["archive_item"]["id"])
 
     async def async_delete_backup(self, backup_id: str, **kwargs: Any) -> None:
-        items = await self._client.list_folder_files()
-        match = next((it for it in items if f"__id-{backup_id}" in it.get("name", "") and it.get("name", "").endswith('.tar')), None)
-        if not match:
+        entry = (await self._build_index()).get(backup_id)
+        if not entry:
             raise BackupNotFound(f"No remote file for {backup_id}")
-        await self._client.delete_file(match["id"])
-        await self._client.delete_file_from_trash(match["id"])
+        await self._delete_entry(entry)
+
+    async def _delete_entry(self, entry: dict) -> None:
+        """Supprime l'archive et son sidecar (l'un des deux peut manquer)."""
+        for key in ("archive_item", "sidecar_item"):
+            item = entry.get(key)
+            if not item:
+                continue
+            await self._client.delete_file(item["id"])
+            self._sidecar_cache.pop(item["id"], None)
+            try:
+                await self._client.delete_file_from_trash(item["id"])
+            except Exception:
+                # Le fichier est déjà hors du dossier: ne pas faire échouer la
+                # suppression pour un nettoyage de corbeille incomplet.
+                _LOGGER.debug("Could not purge %s from trash", item.get("name"))
+        self._backfilled.discard(entry["backup"].backup_id)
 
     async def _enforce_retention(self, retention_count: int) -> None:
-        items = await self._client.list_folder_files()
-        candidates: list[dict] = []
-        for it in items:
-            if try_parse_filename(it.get("name", "")):
-                candidates.append(it)
-        if len(candidates) <= retention_count:
+        index = await self._build_index()
+        entries = sorted(index.values(), key=lambda e: e["backup"].date or "")
+        if len(entries) <= retention_count:
             return
-        candidates.sort(key=lambda it: it.get("name", ""))
-        surplus = candidates[:-retention_count]
-        for it in surplus:
+        for entry in entries[:-retention_count]:
             try:
-                await self._client.delete_file(it["id"])
+                await self._delete_entry(entry)
             except Exception:
+                _LOGGER.warning(
+                    "Could not delete backup %s while enforcing retention",
+                    entry["backup"].backup_id,
+                    exc_info=True,
+                )
                 continue
