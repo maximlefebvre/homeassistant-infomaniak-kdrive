@@ -18,6 +18,10 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 # tout en gardant un timeout raisonnable pour la connexion initiale.
 upload_timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
 
+# Pagination du listing de dossier.
+LIST_PAGE_SIZE = 200
+MAX_LIST_PAGES = 50
+
 def _extract_file_id(payload) -> Optional[int]:
     """Lit l'id du fichier dans une réponse d'upload, sans jamais lever."""
     if not isinstance(payload, dict):
@@ -43,12 +47,76 @@ class KDriveClient:
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     async def list_folder_files(self) -> List[Dict]:
+        """Liste tous les fichiers du dossier, en suivant la pagination.
+
+        Un listing partiel est silencieusement destructeur ici: un sidecar
+        absent du listing fait retomber son backup sur les métadonnées
+        dégradées du nom de fichier. On parcourt donc toutes les pages, en
+        curseur si l'API en fournit un, en numéros de page sinon.
+        """
         url = f"{self._base_v3}/files/{self._folder_id}/files"
-        async with self._session.get(url, headers=self._headers) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            items = data.get("data", [])
-            return [it for it in items if it.get("type") == "file"]
+        items: List[Dict] = []
+        seen: set = set()
+        cursor: Optional[str] = None
+        page = 1
+        page_size: Optional[int] = None
+
+        for _ in range(MAX_LIST_PAGES):
+            params = {"per_page": str(LIST_PAGE_SIZE)}
+            if cursor:
+                params["cursor"] = cursor
+            else:
+                params["page"] = str(page)
+            async with self._session.get(url, headers=self._headers, params=params) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+
+            batch = payload.get("data")
+            if not isinstance(batch, list):
+                break
+            added = 0
+            for it in batch:
+                key = it.get("id")
+                if key is not None and key in seen:
+                    continue
+                if key is not None:
+                    seen.add(key)
+                items.append(it)
+                added += 1
+            # Page ignorée par le serveur (mêmes éléments renvoyés): on arrête
+            # plutôt que de boucler sur la même page.
+            if batch and added == 0:
+                break
+
+            next_cursor = payload.get("cursor")
+            has_more = payload.get("has_more")
+            if has_more is True and next_cursor and next_cursor != cursor:
+                cursor = next_cursor
+                continue
+            if has_more is False:
+                break
+
+            pages = payload.get("pages") or payload.get("total_pages")
+            if pages:
+                try:
+                    if page >= int(pages):
+                        break
+                except (TypeError, ValueError):
+                    break
+                page += 1
+                continue
+
+            # Aucune info de pagination: la taille de page réelle est celle de
+            # la première réponse (le serveur peut plafonner per_page).
+            if page_size is None:
+                page_size = len(batch)
+            if not page_size or len(batch) < page_size:
+                break
+            page += 1
+
+        # On exclut les dossiers plutôt que d'exiger type == "file": un type
+        # inattendu ou absent ne doit pas faire disparaître un fichier.
+        return [it for it in items if it.get("type") not in ("dir", "directory")]
 
     async def upload_bytes(self, *, filename: str, data: bytes) -> Optional[int]:
         """Upload a small in-memory payload (used for the backup metadata sidecars).
@@ -74,6 +142,16 @@ class KDriveClient:
         async with self._session.get(url, headers=self._headers) as resp:
             resp.raise_for_status()
             return await resp.read()
+
+    async def download_file_head(self, file_id: int, size: int) -> bytes:
+        """Read only the first `size` bytes of a file, via a Range request."""
+        url = f"{self._base_v3}/files/{file_id}/download"
+        headers = {**self._headers, "Range": f"bytes=0-{size - 1}"}
+        async with self._session.get(url, headers=headers) as resp:
+            resp.raise_for_status()
+            # Si le serveur ignore le Range et répond 200, on ne lit quand même
+            # que les premiers octets puis on referme: jamais l'archive entière.
+            return await resp.content.read(size)
 
     async def get_file_size(self, file_id: int) -> int:
         url = f"{self._base_v3}/files/{file_id}/download"

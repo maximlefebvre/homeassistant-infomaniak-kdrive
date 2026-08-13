@@ -15,6 +15,19 @@ Backups made with earlier versions stored their metadata inside the filename
 (`…__id-<id>__ver-<version>__prot-<true|false>.tar`). They keep working: they are
 still listed, downloadable and restorable, and a sidecar is written for them
 automatically in the background the first time the backup list is opened.
+
+That migration does not guess: it reads the real metadata from `backup.json`
+inside the archive itself, fetching only its first 256 KiB over an HTTP range
+request. Older backups therefore recover their exact date, folders, add-ons and
+— importantly — the flag Home Assistant uses to recognise its own automatic
+backups, which the filename never carried. If the archive header cannot be read,
+the integration falls back to whatever the filename encodes.
+
+Sidecars written by an early 0.6.0 build carry `"migrated_from": "filename"` and
+incomplete metadata — in particular the automatic-backup flag is missing, so such
+backups show up as manual. They are detected and rebuilt from the archive
+automatically; the corrected values appear on the next refresh of the backup list.
+
 No existing file is ever renamed or deleted during that migration.
 
 ## Installation
