@@ -237,7 +237,8 @@ class KDriveBackupAgent(BackupAgent):
         self._client = client
         # file_id -> (marqueur de révision, payload) : évite de retélécharger les
         # sidecars à chaque listing (HA appelle async_list_backups souvent).
-        self._sidecar_cache: dict[int, tuple[tuple, dict]] = {}
+        # payload None = lecture déjà tentée et échouée pour cette révision
+        self._sidecar_cache: dict[int, tuple[tuple, dict | None]] = {}
         # file_id -> (backup, source) pour les archives sans sidecar: évite de
         # relire l'en-tête de l'archive à chaque listing.
         self._legacy_cache: dict[int, tuple[AgentBackup, str]] = {}
@@ -257,11 +258,22 @@ class KDriveBackupAgent(BackupAgent):
         try:
             raw = await self._client.download_file_bytes(file_id)
             payload = json.loads(raw)
-        except Exception:
-            _LOGGER.warning("Unreadable backup metadata sidecar: %s", item.get("name"))
+        except Exception as err:
+            # L'échec est mémorisé: sans ça, chaque listing relance la lecture,
+            # puis un backfill, puis un 409 — la boucle observée en production.
+            self._sidecar_cache[file_id] = (marker, None)
+            _LOGGER.warning(
+                "Unreadable backup metadata sidecar %s (%s bytes): %s",
+                item.get("name"), item.get("size"), err, exc_info=True,
+            )
             return None
         if not isinstance(payload, dict) or not isinstance(payload.get("backup"), dict):
-            _LOGGER.warning("Malformed backup metadata sidecar: %s", item.get("name"))
+            self._sidecar_cache[file_id] = (marker, None)
+            _LOGGER.warning(
+                "Malformed backup metadata sidecar %s: got keys %s",
+                item.get("name"),
+                list(payload)[:10] if isinstance(payload, dict) else type(payload).__name__,
+            )
             return None
         self._sidecar_cache[file_id] = (marker, payload)
         return payload
@@ -286,14 +298,15 @@ class KDriveBackupAgent(BackupAgent):
             # "archive" = métadonnées réelles lues dans backup.json,
             # "filename" = reconstruites depuis le nom de fichier (dégradées).
             payload["migrated_from"] = migrated
-        # kDrive refuse (ou renomme) un fichier existant: on retire l'ancien
-        # sidecar avant de réécrire. Cas rare, uniquement lors d'un backfill.
+        # kDrive répond 409 sur un nom déjà pris: il faut retirer l'ancien
+        # sidecar avant de réécrire, sinon l'écriture échoue en boucle.
         if replaces:
             self._sidecar_cache.pop(replaces.get("id"), None)
+            await self._client.delete_file(replaces["id"])
             try:
-                await self._client.delete_file(replaces["id"])
+                await self._client.delete_file_from_trash(replaces["id"])
             except Exception:
-                _LOGGER.debug("Could not remove previous sidecar %s", replaces.get("name"))
+                _LOGGER.debug("Could not purge previous sidecar from trash")
         await self._client.upload_bytes(
             filename=sidecar_filename(backup.backup_id),
             data=json.dumps(payload).encode("utf-8"),
@@ -363,20 +376,29 @@ class KDriveBackupAgent(BackupAgent):
             ):
                 pending_upgrade.append((backup.backup_id, archive_item, sidecar_item))
 
-        pending_backfill: list[tuple[dict, AgentBackup, str]] = []
+        # Sidecars repérés par leur nom, y compris ceux qu'on n'a pas su lire:
+        # il faut les connaître pour les remplacer au lieu de heurter un 409.
+        sidecar_by_id = {
+            it["name"][: -len(SIDECAR_SUFFIX)]: it
+            for it in sidecar_items
+            if it.get("name")
+        }
+
+        pending_backfill: list[tuple[dict, AgentBackup, str, dict | None]] = []
         for it in items:
             meta = try_parse_filename(it.get("name", ""))
             if not meta or meta["backup_id"] in index:
                 continue
             backup, source = await self._legacy_backup(it, meta)
+            existing = sidecar_by_id.get(backup.backup_id)
             index[backup.backup_id] = {
                 "backup": backup,
                 "archive_item": it,
-                "sidecar_item": None,
+                "sidecar_item": existing,
                 "legacy": True,
             }
             if backup.backup_id not in self._backfilled:
-                pending_backfill.append((it, backup, source))
+                pending_backfill.append((it, backup, source, existing))
 
         # Diagnostic: d'où viennent les métadonnées de chaque backup, et
         # lesquelles portent le drapeau de backup automatique de HA.
@@ -475,7 +497,7 @@ class KDriveBackupAgent(BackupAgent):
 
     def _schedule_backfill(
         self,
-        pending: list[tuple[dict, AgentBackup, str]],
+        pending: list[tuple[dict, AgentBackup, str, dict | None]],
         upgrades: list[tuple[str, dict, dict]] | None = None,
     ) -> None:
         if self._backfill_task and not self._backfill_task.done():
@@ -530,13 +552,13 @@ class KDriveBackupAgent(BackupAgent):
                 backup.backup_id,
             )
 
-    async def _run_backfill(self, pending: list[tuple[dict, AgentBackup, str]]) -> None:
+    async def _run_backfill(self, pending: list[tuple[dict, AgentBackup, str, dict | None]]) -> None:
         """Écrit un sidecar pour les archives qui n'en ont pas encore.
 
         Best-effort et idempotent: en cas d'échec, le fallback reste en place
         et on retentera au prochain listing.
         """
-        for item, backup, source in pending:
+        for item, backup, source, existing in pending:
             if backup.backup_id in self._backfilled:
                 continue
             try:
@@ -545,6 +567,7 @@ class KDriveBackupAgent(BackupAgent):
                     archive_name=item.get("name", ""),
                     archive_file_id=item.get("id"),
                     migrated=source,
+                    replaces=existing,
                 )
             except Exception:
                 _LOGGER.warning(
