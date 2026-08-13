@@ -378,6 +378,20 @@ class KDriveBackupAgent(BackupAgent):
             if backup.backup_id not in self._backfilled:
                 pending_backfill.append((it, backup, source))
 
+        # Diagnostic: d'où viennent les métadonnées de chaque backup, et
+        # lesquelles portent le drapeau de backup automatique de HA.
+        _LOGGER.debug(
+            "Backup index: %s",
+            {
+                bid: (
+                    ("sidecar" if not e["legacy"] else "archive/filename"),
+                    "automatic" if e["backup"].extra_metadata.get("with_automatic_settings") is True
+                    else "not-automatic",
+                )
+                for bid, e in index.items()
+            },
+        )
+
         if pending_backfill or pending_upgrade:
             self._schedule_backfill(pending_backfill, pending_upgrade)
         return index
@@ -577,7 +591,9 @@ class KDriveBackupAgent(BackupAgent):
         entry = (await self._build_index()).get(backup_id)
         if not entry:
             raise BackupNotFound(f"Archive not found for {backup_id}")
-        return await self._client.download_file_stream(entry["archive_item"]["id"])
+        # Pas de await: download_file_stream est un générateur asynchrone, et
+        # c'est bien l'itérateur lui-même que HA attend en retour.
+        return self._client.download_file_stream(entry["archive_item"]["id"])
 
     async def async_delete_backup(self, backup_id: str, **kwargs: Any) -> None:
         entry = (await self._build_index()).get(backup_id)

@@ -151,14 +151,28 @@ class KDriveClient:
             return await resp.read()
 
     async def download_file_head(self, file_id: int, size: int) -> bytes:
-        """Read only the first `size` bytes of a file, via a Range request."""
+        """Read only the first `size` bytes of a file.
+
+        Tente d'abord une requête Range. Si le serveur la rejette, refait une
+        requête normale et coupe après `size` octets: on ne lit jamais
+        l'archive entière, même sans support du Range.
+        """
         url = f"{self._base_v3}/files/{file_id}/download"
-        headers = {**self._headers, "Range": f"bytes=0-{size - 1}"}
-        async with self._session.get(url, headers=headers) as resp:
-            resp.raise_for_status()
-            # Si le serveur ignore le Range et répond 200, on ne lit quand même
-            # que les premiers octets puis on referme: jamais l'archive entière.
-            return await resp.content.read(size)
+        for headers in ({**self._headers, "Range": f"bytes=0-{size - 1}"}, self._headers):
+            try:
+                async with self._session.get(url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    # Un serveur qui ignore le Range répond 200 avec tout le
+                    # fichier: on s'arrête quand même aux premiers octets.
+                    return await resp.content.read(size)
+            except Exception as err:
+                last_err = err
+                _LOGGER.debug(
+                    "Head read of file %s failed (%s), %s",
+                    file_id, err,
+                    "retrying without Range" if "Range" in headers else "giving up",
+                )
+        raise last_err
 
     async def get_file_size(self, file_id: int) -> int:
         url = f"{self._base_v3}/files/{file_id}/download"
@@ -198,10 +212,12 @@ class KDriveClient:
 
     async def download_file_stream(self, file_id: int) -> AsyncIterator[bytes]:
         url = f"{self._base_v3}/files/{file_id}/download"
-        resp = await self._session.get(url, headers=self._headers)
-        resp.raise_for_status()
-        async for chunk in resp.content.iter_chunked(64 * 1024):
-            yield chunk
+        # async with: la réponse est refermée même si le consommateur
+        # abandonne le téléchargement en cours de route.
+        async with self._session.get(url, headers=self._headers) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                yield chunk
 
     async def upload_stream_to_folder(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> Optional[int]:
         """Upload the backup archive. Returns the id of the created file if known."""
