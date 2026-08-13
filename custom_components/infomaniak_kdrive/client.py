@@ -1,15 +1,14 @@
 
 from __future__ import annotations
 import hashlib
+import logging
 import math
 from typing import AsyncIterator, Dict, List, Optional
 import os
 import tempfile
 import aiohttp
 
-# import logging
-# logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
-# _LOGGER = logging.getLogger(__name__)
+_LOGGER = logging.getLogger(__name__)
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -18,8 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 # tout en gardant un timeout raisonnable pour la connexion initiale.
 upload_timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
 
-# Pagination du listing de dossier.
-LIST_PAGE_SIZE = 200
+# Garde-fou de pagination du listing de dossier.
 MAX_LIST_PAGES = 50
 
 def _extract_file_id(payload) -> Optional[int]:
@@ -57,19 +55,28 @@ class KDriveClient:
         url = f"{self._base_v3}/files/{self._folder_id}/files"
         items: List[Dict] = []
         seen: set = set()
-        cursor: Optional[str] = None
-        page = 1
-        page_size: Optional[int] = None
+        params: Optional[Dict[str, str]] = None  # 1re requête: aucun paramètre
 
         for _ in range(MAX_LIST_PAGES):
-            params = {"per_page": str(LIST_PAGE_SIZE)}
-            if cursor:
-                params["cursor"] = cursor
-            else:
-                params["page"] = str(page)
-            async with self._session.get(url, headers=self._headers, params=params) as resp:
-                resp.raise_for_status()
-                payload = await resp.json()
+            try:
+                async with self._session.get(url, headers=self._headers, params=params) as resp:
+                    if resp.status >= 400:
+                        body = (await resp.text())[:300]
+                        _LOGGER.debug("kDrive listing %s -> %s: %s", resp.url, resp.status, body)
+                    resp.raise_for_status()
+                    payload = await resp.json()
+            except Exception:
+                if not items:
+                    raise  # la première page échoue: c'est une vraie erreur
+                # Une page suivante échoue: mieux vaut un listing partiel qu'un
+                # agent hors service, mais il faut que ça se voie.
+                _LOGGER.warning(
+                    "Partial kDrive folder listing (%d files so far): pagination request failed. "
+                    "Backups whose metadata sidecar is missing from the listing will show "
+                    "incomplete information",
+                    len(items), exc_info=True,
+                )
+                break
 
             batch = payload.get("data")
             if not isinstance(batch, list):
@@ -88,35 +95,35 @@ class KDriveClient:
             if batch and added == 0:
                 break
 
-            next_cursor = payload.get("cursor")
-            has_more = payload.get("has_more")
-            if has_more is True and next_cursor and next_cursor != cursor:
-                cursor = next_cursor
-                continue
-            if has_more is False:
+            # On ne pagine que selon ce que la réponse annonce elle-même:
+            # aucun paramètre n'est envoyé "au cas où".
+            params = self._next_page_params(payload, params)
+            if params is None:
                 break
-
-            pages = payload.get("pages") or payload.get("total_pages")
-            if pages:
-                try:
-                    if page >= int(pages):
-                        break
-                except (TypeError, ValueError):
-                    break
-                page += 1
-                continue
-
-            # Aucune info de pagination: la taille de page réelle est celle de
-            # la première réponse (le serveur peut plafonner per_page).
-            if page_size is None:
-                page_size = len(batch)
-            if not page_size or len(batch) < page_size:
-                break
-            page += 1
 
         # On exclut les dossiers plutôt que d'exiger type == "file": un type
         # inattendu ou absent ne doit pas faire disparaître un fichier.
         return [it for it in items if it.get("type") not in ("dir", "directory")]
+
+    @staticmethod
+    def _next_page_params(payload: Dict, current: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+        """Paramètres de la page suivante, ou None s'il n'y en a pas."""
+        cursor = payload.get("cursor")
+        has_more = payload.get("has_more")
+        if has_more is False:
+            return None
+        if has_more and cursor and (current or {}).get("cursor") != cursor:
+            return {"cursor": str(cursor)}
+
+        pages = payload.get("pages") or payload.get("total_pages")
+        page = payload.get("page") or (current or {}).get("page") or 1
+        try:
+            page, pages = int(page), int(pages) if pages else 0
+        except (TypeError, ValueError):
+            return None
+        if pages and page < pages:
+            return {"page": str(page + 1)}
+        return None
 
     async def upload_bytes(self, *, filename: str, data: bytes) -> Optional[int]:
         """Upload a small in-memory payload (used for the backup metadata sidecars).
