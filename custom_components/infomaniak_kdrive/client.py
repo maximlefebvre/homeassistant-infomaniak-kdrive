@@ -43,6 +43,8 @@ class KDriveClient:
         self._base_v3 = f"https://api.infomaniak.com/3/drive/{drive_id}"
         self._base_v2 = f"https://api.infomaniak.com/2/drive/{drive_id}"
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
+        # Version d'API retenue pour les téléchargements (découverte au 1er appel)
+        self._download_api: Optional[int] = None
 
     async def list_folder_files(self) -> List[Dict]:
         """Liste tous les fichiers du dossier, en suivant la pagination.
@@ -144,11 +146,47 @@ class KDriveClient:
                 return None
         return _extract_file_id(payload)
 
+    def _download_candidates(self, file_id: int) -> List[tuple]:
+        """URLs de téléchargement à essayer, la variante connue en premier.
+
+        Le client kDrive officiel construit cette URL en v2
+        (ApiRoutes.downloadFile = fileURLV2 + "/download"); la v3 répond 404.
+        On garde la v3 en repli au cas où elle existerait sur d'autres drives,
+        et on mémorise la variante qui a fonctionné.
+        """
+        urls = [
+            (2, f"{self._base_v2}/files/{file_id}/download"),
+            (3, f"{self._base_v3}/files/{file_id}/download"),
+        ]
+        if self._download_api is not None:
+            urls.sort(key=lambda u: u[0] != self._download_api)
+        return urls
+
+    async def _open_download(self, file_id: int, extra_headers: Optional[Dict] = None):
+        """Ouvre une réponse sur le téléchargement. L'appelant doit la libérer."""
+        last_err: Optional[Exception] = None
+        headers = {**self._headers, **(extra_headers or {})}
+        for api, url in self._download_candidates(file_id):
+            try:
+                resp = await self._session.get(url, headers=headers)
+                # raise_for_status() libère la connexion avant de lever.
+                resp.raise_for_status()
+            except Exception as err:
+                last_err = err
+                _LOGGER.debug("Download via API v%s failed for %s: %s", api, file_id, err)
+                continue
+            if self._download_api != api:
+                _LOGGER.debug("Using kDrive API v%s for downloads", api)
+                self._download_api = api
+            return resp
+        raise last_err
+
     async def download_file_bytes(self, file_id: int) -> bytes:
-        url = f"{self._base_v3}/files/{file_id}/download"
-        async with self._session.get(url, headers=self._headers) as resp:
-            resp.raise_for_status()
+        resp = await self._open_download(file_id)
+        try:
             return await resp.read()
+        finally:
+            resp.release()
 
     async def download_file_head(self, file_id: int, size: int) -> bytes:
         """Read only the first `size` bytes of a file.
@@ -157,46 +195,42 @@ class KDriveClient:
         requête normale et coupe après `size` octets: on ne lit jamais
         l'archive entière, même sans support du Range.
         """
-        url = f"{self._base_v3}/files/{file_id}/download"
-        for headers in ({**self._headers, "Range": f"bytes=0-{size - 1}"}, self._headers):
+        for extra in ({"Range": f"bytes=0-{size - 1}"}, None):
             try:
-                async with self._session.get(url, headers=headers) as resp:
-                    resp.raise_for_status()
-                    # Un serveur qui ignore le Range répond 200 avec tout le
-                    # fichier: on s'arrête quand même aux premiers octets.
-                    return await resp.content.read(size)
+                resp = await self._open_download(file_id, extra)
             except Exception as err:
                 last_err = err
-                _LOGGER.debug(
-                    "Head read of file %s failed (%s), %s",
-                    file_id, err,
-                    "retrying without Range" if "Range" in headers else "giving up",
-                )
+                continue
+            try:
+                # Un serveur qui ignore le Range répond 200 avec tout le
+                # fichier: on s'arrête quand même aux premiers octets.
+                return await resp.content.read(size)
+            finally:
+                resp.release()
         raise last_err
 
     async def get_file_size(self, file_id: int) -> int:
-        url = f"{self._base_v3}/files/{file_id}/download"
+        for _, url in self._download_candidates(file_id):
+            try:
+                async with self._session.head(url, headers=self._headers) as resp:
+                    if resp.status < 400:
+                        cl = resp.headers.get('Content-Length')
+                        if cl is not None:
+                            try:
+                                return int(cl)
+                            except ValueError:
+                                pass
+            except Exception:
+                pass
         try:
-            async with self._session.head(url, headers=self._headers) as resp:
-                if resp.status < 400:
-                    cl = resp.headers.get('Content-Length')
-                    if cl is not None:
-                        try:
-                            return int(cl)
-                        except ValueError:
-                            pass
-        except Exception:
-            pass
-        try:
-            async with self._session.get(url, headers=self._headers) as resp:
-                resp.raise_for_status()
+            resp = await self._open_download(file_id)
+            try:
                 cl = resp.headers.get('Content-Length')
                 if cl is not None:
-                    try:
-                        return int(cl)
-                    except ValueError:
-                        pass
-        except Exception:
+                    return int(cl)
+            finally:
+                resp.release()
+        except (Exception, ValueError):
             pass
         return 0
 
@@ -211,13 +245,14 @@ class KDriveClient:
             resp.raise_for_status()
 
     async def download_file_stream(self, file_id: int) -> AsyncIterator[bytes]:
-        url = f"{self._base_v3}/files/{file_id}/download"
-        # async with: la réponse est refermée même si le consommateur
+        resp = await self._open_download(file_id)
+        # try/finally: la réponse est libérée même si le consommateur
         # abandonne le téléchargement en cours de route.
-        async with self._session.get(url, headers=self._headers) as resp:
-            resp.raise_for_status()
+        try:
             async for chunk in resp.content.iter_chunked(64 * 1024):
                 yield chunk
+        finally:
+            resp.release()
 
     async def upload_stream_to_folder(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> Optional[int]:
         """Upload the backup archive. Returns the id of the created file if known."""
