@@ -3,6 +3,8 @@
 ## Description
 This integration allows you to sync and save your Home Assistant backups directly to Infomaniak kDrive.
 
+> An independent project, not affiliated with or endorsed by Infomaniak. See [Disclaimer](#disclaimer).
+
 ## Features
 - API Token Connection: no WebDAV, and no OAuth application to register — a single API token is all you need.
 - Simplified Input: Simply paste the full kDrive folder URL (e.g., https://ksuite.infomaniak.com/02468/kdrive/app/drive/12345/files/67890).
@@ -45,6 +47,9 @@ No existing file is ever renamed or deleted during that migration.
 https://ksuite.infomaniak.com/02468/kdrive/app/drive/12345/files/67890
 ```
 The integration will automatically extract `drive_id=1234` and `folder_id=67890` from this link.
+
+## Disclaimer
+This is an independent, community-maintained project. It is not affiliated with, endorsed by, sponsored by or supported by Infomaniak. "Infomaniak" and "kDrive" are trademarks of their respective owner and are used here only to describe the service this integration connects to.
 
 ## License
 Licensed under the [Apache License 2.0](LICENSE).
