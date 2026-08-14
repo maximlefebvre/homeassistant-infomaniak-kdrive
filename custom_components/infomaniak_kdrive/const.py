@@ -14,26 +14,22 @@ DATA_BACKUP_AGENT_LISTENERS = "backup_agent_listeners"
 
 AGENT_NAME = "Infomaniak kDrive"
 
-# Marqueurs encodés dans le nom de l'archive.
-# ID_TAG est toujours écrit (filet de sécurité si le sidecar est perdu).
-# VER_TAG / PROT_TAG ne sont plus écrits depuis 0.6.0 mais restent lus pour
-# les archives créées par les versions précédentes.
+# Markers encoded in the archive filename.
+# ID_TAG is always written (a safety net in case the sidecar is lost).
+# VER_TAG / PROT_TAG are no longer written since 0.6.0, but are still read so
+# that archives created by earlier versions keep working.
 ID_TAG = "__id-"
 VER_TAG = "__ver-"
 PROT_TAG = "__prot-"
 
-# Sidecar de métadonnées: un fichier <backup_id>.metadata.json par archive.
+# Metadata sidecar: one <backup_id>.metadata.json file per archive.
 SIDECAR_SUFFIX = ".metadata.json"
 METADATA_VERSION = 1
-
-OAUTH2_AUTHORIZE = "https://login.infomaniak.com/authorize"
-OAUTH2_TOKEN = "https://login.infomaniak.com/token"
-SCOPES = "kdrive:read kdrive:write"
 
 KDRIVE_FOLDER_RE = re.compile(r"/drive/(?P<drive_id>\d+)/files/(?P<folder_id>\d+)(?:/|$)")
 
 def parse_kdrive_folder_url(url: str) -> tuple[int, int]:
     m = KDRIVE_FOLDER_RE.search(url)
     if not m:
-        raise ValueError("URL de dossier kDrive non reconnue")
+        raise ValueError("Unrecognised kDrive folder URL")
     return int(m.group("drive_id")), int(m.group("folder_id"))

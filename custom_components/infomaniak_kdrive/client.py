@@ -13,15 +13,15 @@ _LOGGER = logging.getLogger(__name__)
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-# Désactiver le timeout total pour les uploads (ou mettre une valeur très haute)
-# tout en gardant un timeout raisonnable pour la connexion initiale.
+# No overall timeout for uploads (they can legitimately run for a long time),
+# but keep sensible limits on the initial connection and on socket reads.
 upload_timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
 
-# Garde-fou de pagination du listing de dossier.
+# Safety limit on how many folder listing pages we will follow.
 MAX_LIST_PAGES = 50
 
 def _extract_file_id(payload) -> Optional[int]:
-    """Lit l'id du fichier dans une réponse d'upload, sans jamais lever."""
+    """Read the file id out of an upload response, never raising."""
     if not isinstance(payload, dict):
         return None
     data = payload.get("data")
@@ -43,21 +43,19 @@ class KDriveClient:
         self._base_v3 = f"https://api.infomaniak.com/3/drive/{drive_id}"
         self._base_v2 = f"https://api.infomaniak.com/2/drive/{drive_id}"
         self._headers = {"Authorization": f"Bearer {token}"} if token else {}
-        # Version d'API retenue pour les téléchargements (découverte au 1er appel)
-        self._download_api: Optional[int] = None
 
     async def list_folder_files(self) -> List[Dict]:
-        """Liste tous les fichiers du dossier, en suivant la pagination.
+        """List every file in the folder, following pagination.
 
-        Un listing partiel est silencieusement destructeur ici: un sidecar
-        absent du listing fait retomber son backup sur les métadonnées
-        dégradées du nom de fichier. On parcourt donc toutes les pages, en
-        curseur si l'API en fournit un, en numéros de page sinon.
+        A partial listing is silently destructive here: a sidecar missing from
+        the listing makes its backup fall back to the degraded metadata encoded
+        in the filename. So we walk every page, by cursor when the API provides
+        one, by page number otherwise.
         """
         url = f"{self._base_v3}/files/{self._folder_id}/files"
         items: List[Dict] = []
         seen: set = set()
-        params: Optional[Dict[str, str]] = None  # 1re requête: aucun paramètre
+        params: Optional[Dict[str, str]] = None  # first request: no parameters
 
         for _ in range(MAX_LIST_PAGES):
             try:
@@ -69,9 +67,9 @@ class KDriveClient:
                     payload = await resp.json()
             except Exception:
                 if not items:
-                    raise  # la première page échoue: c'est une vraie erreur
-                # Une page suivante échoue: mieux vaut un listing partiel qu'un
-                # agent hors service, mais il faut que ça se voie.
+                    raise  # the first page failed: that is a real error
+                # A later page failed: a partial listing beats a dead agent,
+                # but it must not go unnoticed.
                 _LOGGER.warning(
                     "Partial kDrive folder listing (%d files so far): pagination request failed. "
                     "Backups whose metadata sidecar is missing from the listing will show "
@@ -92,24 +90,24 @@ class KDriveClient:
                     seen.add(key)
                 items.append(it)
                 added += 1
-            # Page ignorée par le serveur (mêmes éléments renvoyés): on arrête
-            # plutôt que de boucler sur la même page.
+            # The server ignored our paging (same items returned): stop
+            # rather than loop forever on the same page.
             if batch and added == 0:
                 break
 
-            # On ne pagine que selon ce que la réponse annonce elle-même:
-            # aucun paramètre n'est envoyé "au cas où".
+            # We only paginate according to what the response itself
+            # advertises; no parameter is ever sent speculatively.
             params = self._next_page_params(payload, params)
             if params is None:
                 break
 
-        # On exclut les dossiers plutôt que d'exiger type == "file": un type
-        # inattendu ou absent ne doit pas faire disparaître un fichier.
+        # Exclude directories rather than requiring type == "file": an
+        # unexpected or missing type must not make a file disappear.
         return [it for it in items if it.get("type") not in ("dir", "directory")]
 
     @staticmethod
     def _next_page_params(payload: Dict, current: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
-        """Paramètres de la page suivante, ou None s'il n'y en a pas."""
+        """Parameters for the next page, or None when there is none."""
         cursor = payload.get("cursor")
         has_more = payload.get("has_more")
         if has_more is False:
@@ -146,40 +144,22 @@ class KDriveClient:
                 return None
         return _extract_file_id(payload)
 
-    def _download_candidates(self, file_id: int) -> List[tuple]:
-        """URLs de téléchargement à essayer, la variante connue en premier.
+    def _download_url(self, file_id: int) -> str:
+        """Download URL for a file.
 
-        Le client kDrive officiel construit cette URL en v2
-        (ApiRoutes.downloadFile = fileURLV2 + "/download"); la v3 répond 404.
-        On garde la v3 en repli au cas où elle existerait sur d'autres drives,
-        et on mémorise la variante qui a fonctionné.
+        This endpoint lives on API v2: the official kDrive client builds it as
+        ApiRoutes.downloadFile = fileURLV2 + "/download". The v3 equivalent
+        answers 404.
         """
-        urls = [
-            (2, f"{self._base_v2}/files/{file_id}/download"),
-            (3, f"{self._base_v3}/files/{file_id}/download"),
-        ]
-        if self._download_api is not None:
-            urls.sort(key=lambda u: u[0] != self._download_api)
-        return urls
+        return f"{self._base_v2}/files/{file_id}/download"
 
     async def _open_download(self, file_id: int, extra_headers: Optional[Dict] = None):
-        """Ouvre une réponse sur le téléchargement. L'appelant doit la libérer."""
-        last_err: Optional[Exception] = None
+        """Open a download response. The caller is responsible for releasing it."""
         headers = {**self._headers, **(extra_headers or {})}
-        for api, url in self._download_candidates(file_id):
-            try:
-                resp = await self._session.get(url, headers=headers)
-                # raise_for_status() libère la connexion avant de lever.
-                resp.raise_for_status()
-            except Exception as err:
-                last_err = err
-                _LOGGER.debug("Download via API v%s failed for %s: %s", api, file_id, err)
-                continue
-            if self._download_api != api:
-                _LOGGER.debug("Using kDrive API v%s for downloads", api)
-                self._download_api = api
-            return resp
-        raise last_err
+        resp = await self._session.get(self._download_url(file_id), headers=headers)
+        # raise_for_status() releases the connection before raising.
+        resp.raise_for_status()
+        return resp
 
     async def download_file_bytes(self, file_id: int) -> bytes:
         resp = await self._open_download(file_id)
@@ -191,10 +171,11 @@ class KDriveClient:
     async def download_file_head(self, file_id: int, size: int) -> bytes:
         """Read only the first `size` bytes of a file.
 
-        Tente d'abord une requête Range. Si le serveur la rejette, refait une
-        requête normale et coupe après `size` octets: on ne lit jamais
-        l'archive entière, même sans support du Range.
+        Tries a Range request first. If the server rejects it, falls back to a
+        plain request and stops after `size` bytes: the whole archive is never
+        downloaded, even without Range support.
         """
+        last_err: Optional[Exception] = None
         for extra in ({"Range": f"bytes=0-{size - 1}"}, None):
             try:
                 resp = await self._open_download(file_id, extra)
@@ -202,26 +183,22 @@ class KDriveClient:
                 last_err = err
                 continue
             try:
-                # Un serveur qui ignore le Range répond 200 avec tout le
-                # fichier: on s'arrête quand même aux premiers octets.
+                # A server ignoring Range answers 200 with the whole file:
+                # stop at the first bytes regardless.
                 return await resp.content.read(size)
             finally:
                 resp.release()
-        raise last_err
+        raise last_err or RuntimeError(f"Could not read the head of file {file_id}")
 
     async def get_file_size(self, file_id: int) -> int:
-        for _, url in self._download_candidates(file_id):
-            try:
-                async with self._session.head(url, headers=self._headers) as resp:
-                    if resp.status < 400:
-                        cl = resp.headers.get('Content-Length')
-                        if cl is not None:
-                            try:
-                                return int(cl)
-                            except ValueError:
-                                pass
-            except Exception:
-                pass
+        try:
+            async with self._session.head(self._download_url(file_id), headers=self._headers) as resp:
+                if resp.status < 400:
+                    cl = resp.headers.get('Content-Length')
+                    if cl is not None:
+                        return int(cl)
+        except Exception:
+            pass
         try:
             resp = await self._open_download(file_id)
             try:
@@ -230,7 +207,7 @@ class KDriveClient:
                     return int(cl)
             finally:
                 resp.release()
-        except (Exception, ValueError):
+        except Exception:
             pass
         return 0
 
@@ -246,8 +223,8 @@ class KDriveClient:
 
     async def download_file_stream(self, file_id: int) -> AsyncIterator[bytes]:
         resp = await self._open_download(file_id)
-        # try/finally: la réponse est libérée même si le consommateur
-        # abandonne le téléchargement en cours de route.
+        # try/finally: the response is released even if the consumer
+        # abandons the download halfway through.
         try:
             async for chunk in resp.content.iter_chunked(64 * 1024):
                 yield chunk

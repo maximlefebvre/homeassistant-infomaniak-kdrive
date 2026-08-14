@@ -13,8 +13,6 @@
     "custom_components.infomaniak_kdrive"
   ],
   "integration_type": "hub",
-  "dependencies": [
-    "application_credentials"
-  ],
+  "dependencies": [],
   "icon": "logo.png"
 }
