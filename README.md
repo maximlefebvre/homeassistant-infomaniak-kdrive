@@ -45,3 +45,6 @@ No existing file is ever renamed or deleted during that migration.
 https://ksuite.infomaniak.com/02468/kdrive/app/drive/12345/files/67890
 ```
 The integration will automatically extract `drive_id=1234` and `folder_id=67890` from this link.
+
+## License
+Licensed under the [Apache License 2.0](LICENSE).
