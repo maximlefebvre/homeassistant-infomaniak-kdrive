@@ -265,6 +265,11 @@ class KDriveBackupAgent(BackupAgent):
         self._backfilled: set[str] = set()
         # backups whose degraded sidecar we already tried to rebuild
         self._upgrade_attempted: set[str] = set()
+        # backups deleted by this agent: a sidecar write scheduled before the
+        # deletion must not recreate metadata for an archive that is gone
+        self._deleted: set[str] = set()
+        # orphan sidecars already reported, to keep the warning out of the loop
+        self._orphans_logged: set[str] = set()
         self._backfill_task: asyncio.Task | None = None
 
     # --- Sidecar I/O ---------------------------------------------------
@@ -377,9 +382,16 @@ class KDriveBackupAgent(BackupAgent):
             if archive_item is None:
                 # Orphan sidecar: not exposed (the backup cannot be restored)
                 # and not deleted either, since the listing may be partial.
-                _LOGGER.warning(
-                    "Backup metadata found without its archive, ignoring: %s", sidecar_item.get("name")
-                )
+                # Reported once per file so a leftover does not flood the log.
+                name = sidecar_item.get("name") or ""
+                if name not in self._orphans_logged:
+                    self._orphans_logged.add(name)
+                    _LOGGER.warning(
+                        "Backup metadata found without its archive, ignoring: %s. "
+                        "Its backup no longer exists in the kDrive folder; this file "
+                        "holds no backup data and can be deleted",
+                        name,
+                    )
                 continue
             index[backup.backup_id] = {
                 "backup": backup,
@@ -542,6 +554,8 @@ class KDriveBackupAgent(BackupAgent):
         Replace them with the real metadata.
         """
         for backup_id, archive_item, sidecar_item in upgrades:
+            if backup_id in self._deleted:
+                continue
             # Marked either way: if the archive is unreadable there is no
             # point retrying on every listing. A restart retries it.
             self._upgrade_attempted.add(backup_id)
@@ -582,6 +596,10 @@ class KDriveBackupAgent(BackupAgent):
         for item, backup, source, existing in pending:
             if backup.backup_id in self._backfilled:
                 continue
+            if backup.backup_id in self._deleted:
+                # Deleted by retention while this write was queued; writing now
+                # would leave a sidecar with no archive behind it.
+                continue
             try:
                 await self._write_sidecar(
                     backup,
@@ -606,6 +624,7 @@ class KDriveBackupAgent(BackupAgent):
     async def async_upload_backup(self, *, open_stream: Callable[[], Coroutine[Any, Any, AsyncIterator[bytes]]], backup: AgentBackup, **kwargs: Any) -> None:
         filename = make_filename(backup)
         size_hint = getattr(backup, "size", None)
+        self._deleted.discard(backup.backup_id)
         # Archive first: a sidecar without an archive would create a phantom
         # backup, whereas an archive without a sidecar stays readable.
         file_id = await self._client.upload_stream_to_folder(
@@ -660,7 +679,9 @@ class KDriveBackupAgent(BackupAgent):
                 # The file is already out of the folder: do not fail the
                 # deletion over an incomplete trash cleanup.
                 _LOGGER.debug("Could not purge %s from trash", item.get("name"))
-        self._backfilled.discard(entry["backup"].backup_id)
+        backup_id = entry["backup"].backup_id
+        self._backfilled.discard(backup_id)
+        self._deleted.add(backup_id)
 
     async def _enforce_retention(self, retention_count: int) -> None:
         index = await self._build_index()

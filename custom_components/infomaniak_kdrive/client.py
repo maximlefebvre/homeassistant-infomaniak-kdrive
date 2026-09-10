@@ -20,6 +20,43 @@ upload_timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
 # Safety limit on how many folder listing pages we will follow.
 MAX_LIST_PAGES = 50
 
+# The spool file is written and re-read through the executor: doing it inline
+# blocks the whole Home Assistant event loop for the duration of a multi-GiB
+# upload. Parts are batched so one write costs one executor round-trip.
+SPOOL_DIR = "/media"
+SPOOL_WRITE_BUFFER = 8 * 1024 * 1024
+
+
+def _make_spool():
+    return tempfile.mkstemp(prefix="ha-kdrive-", suffix=".bin", dir=SPOOL_DIR)
+
+
+def _open_spool(path: str, mode: str):
+    return open(path, mode)
+
+
+def _write_spool(handle, data: bytes) -> None:
+    handle.write(data)
+
+
+def _read_spool_chunk(handle, size: int, digest):
+    """Read one chunk, feed the whole-file digest, and hash the chunk itself."""
+    data = handle.read(size)
+    digest.update(data)
+    return data, hashlib.sha256(data).hexdigest() if data else None
+
+
+def _close_spool(handle) -> None:
+    handle.close()
+
+
+def _remove_spool(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _extract_file_id(payload) -> Optional[int]:
     """Read the file id out of an upload response, never raising."""
     if not isinstance(payload, dict):
@@ -143,6 +180,10 @@ class KDriveClient:
             except Exception:
                 return None
         return _extract_file_id(payload)
+
+    async def _io(self, func, *args):
+        """Run a blocking file operation off the event loop."""
+        return await self._hass.async_add_executor_job(func, *args)
 
     def _download_url(self, file_id: int) -> str:
         """Download URL for a file.
@@ -273,18 +314,26 @@ class KDriveClient:
                 # ------------------------------------------------------------------
                 else:
                     # --- WRITE THE WHOLE STREAM TO DISK FIRST (no RAM buffering) --- #
-                    fd, tmp_path = tempfile.mkstemp(prefix="ha-kdrive-", suffix=".bin",  dir="/media")
-                    os.close(fd)
+                    fd, tmp_path = await self._io(_make_spool)
+                    await self._io(os.close, fd)
                     try:
-                        with open(tmp_path, "ab") as f:
-                            async for part in await open_stream():
-                                f.write(part)
-                        total_size = os.path.getsize(tmp_path)
-                    except Exception:
+                        handle = await self._io(_open_spool, tmp_path, "ab")
                         try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
+                            # Parts arrive small; batch them so one disk write
+                            # costs one executor round-trip instead of thousands.
+                            buffered = bytearray()
+                            async for part in await open_stream():
+                                buffered += part
+                                if len(buffered) >= SPOOL_WRITE_BUFFER:
+                                    await self._io(_write_spool, handle, bytes(buffered))
+                                    buffered.clear()
+                            if buffered:
+                                await self._io(_write_spool, handle, bytes(buffered))
+                        finally:
+                            await self._io(_close_spool, handle)
+                        total_size = await self._io(os.path.getsize, tmp_path)
+                    except Exception:
+                        await self._io(_remove_spool, tmp_path)
                         raise
                                         
                     # --- START SESSION --- #
@@ -308,35 +357,41 @@ class KDriveClient:
                     
                     # --- READ THE FILE BY CHUNKS & CALCULATE THE SHA256 --- #
                     sha256_file = hashlib.sha256()
+
                     async def chunk_iter():
-                        with open(tmp_path, "rb") as f:
+                        # Reading and hashing both happen in the executor: a
+                        # 5 MiB read plus its sha256 is far too slow to run on
+                        # the event loop, once per chunk, for a whole archive.
+                        handle = await self._io(_open_spool, tmp_path, "rb")
+                        try:
                             while True:
-                                buf = f.read(chunk_size)
-                                sha256_file.update(buf)
+                                buf, buf_hash = await self._io(
+                                    _read_spool_chunk, handle, chunk_size, sha256_file
+                                )
                                 if not buf:
                                     break
-                                yield buf
-                    
+                                yield buf, buf_hash
+                        finally:
+                            await self._io(_close_spool, handle)
+
                     # --- LOOK TO UPLOAD EACH CHUNK --- #
                     iteration = 0
-                    async for chunk in chunk_iter():
+                    async for chunk, chunk_hash in chunk_iter():
                         iteration += 1
                         url = f"{upload_url_session}/3/drive/{self._drive_id}/upload/session/{session_token}/chunk"                        
                         params = {
                             "chunk_number": iteration,
                             "chunk_size": len(chunk),
-                            "chunk_hash": f"sha256:{hashlib.sha256(chunk).hexdigest()}",
+                            "chunk_hash": f"sha256:{chunk_hash}",
                         }
                         async with upload_session.post(url, headers=self._headers, params=params, data=chunk
                         ) as resp:
                             resp.raise_for_status()
                             data = await resp.json()
                     
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-                  
+                    await self._io(_remove_spool, tmp_path)
+                    tmp_path = None
+
                     # --- CLOSE THE SESSION --- #
                     url = f"{self._base_v3}/upload/session/{session_token}/finish?with=capabilities,supported_by,conversion_capabilities,users,teams,path,parents,parents.capabilities,parents.users,parents.teams,parents.path"
                     params = {
@@ -364,9 +419,6 @@ class KDriveClient:
             # --- REMOVE THE BACKUP FILE IN MEDIA FOLDER --- #
             finally:
                 if tmp_path:
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
+                    await self._io(_remove_spool, tmp_path)
 
             return uploaded_id
