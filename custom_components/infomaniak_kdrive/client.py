@@ -1,5 +1,6 @@
 
 from __future__ import annotations
+import asyncio
 import hashlib
 import logging
 import math
@@ -19,6 +20,29 @@ upload_timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
 
 # Safety limit on how many folder listing pages we will follow.
 MAX_LIST_PAGES = 50
+
+# A backup upload runs for minutes; a single dropped connection must not throw
+# the whole archive away. Transient failures are retried with a growing delay.
+UPLOAD_ATTEMPTS = 4
+UPLOAD_RETRY_DELAYS = (5, 20, 60)
+
+
+def _is_retryable(err: BaseException) -> bool:
+    """Whether a failed request is worth sending again.
+
+    Network faults and server-side errors are; anything the server rejected on
+    its merits (auth, quota, bad request) is not, and retrying would only
+    repeat the same refusal.
+    """
+    if isinstance(err, aiohttp.ClientResponseError):
+        return err.status in (408, 429) or err.status >= 500
+    # ClientOSError and ConnectionResetError are both OSError subclasses.
+    return isinstance(err, (
+        asyncio.TimeoutError,
+        OSError,
+        aiohttp.ClientPayloadError,
+        aiohttp.ClientConnectionError,
+    ))
 
 # The spool file is written and re-read through the executor: doing it inline
 # blocks the whole Home Assistant event loop for the duration of a multi-GiB
@@ -272,6 +296,57 @@ class KDriveClient:
         finally:
             resp.release()
 
+    async def _find_file_by_name(self, filename: str) -> Optional[int]:
+        """Id of a file in the backup folder, by name. None if absent."""
+        try:
+            for it in await self.list_folder_files():
+                if it.get("name") == filename:
+                    file_id = it.get("id")
+                    return file_id if isinstance(file_id, int) else None
+        except Exception:
+            _LOGGER.debug("Could not look up %s after a failed upload", filename, exc_info=True)
+        return None
+
+    async def _upload_direct(self, session, url, params, filename, open_stream) -> Optional[int]:
+        """Single-request upload, retried on transient network failures.
+
+        open_stream is a factory, so each attempt gets a fresh stream; that is
+        what makes retrying possible at all.
+        """
+        last_err: Optional[BaseException] = None
+        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+            try:
+                async with session.post(
+                    url, headers=self._headers, params=params,
+                    data=await open_stream(), timeout=upload_timeout,
+                ) as resp:
+                    resp.raise_for_status()
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        data = {}
+                return _extract_file_id(data)
+            except Exception as err:
+                last_err = err
+                if not _is_retryable(err) or attempt == UPLOAD_ATTEMPTS:
+                    raise
+                # The connection may have dropped after the server stored the
+                # file; uploading again would duplicate it.
+                existing = await self._find_file_by_name(filename)
+                if existing is not None:
+                    _LOGGER.warning(
+                        "Upload of %s reported %s, but the file is present on kDrive; "
+                        "treating it as complete", filename, err,
+                    )
+                    return existing
+                delay = UPLOAD_RETRY_DELAYS[min(attempt - 1, len(UPLOAD_RETRY_DELAYS) - 1)]
+                _LOGGER.warning(
+                    "Upload of %s failed (%s), retrying in %ss (attempt %d of %d)",
+                    filename, err, delay, attempt + 1, UPLOAD_ATTEMPTS,
+                )
+                await asyncio.sleep(delay)
+        raise last_err or RuntimeError(f"Could not upload {filename}")
+
     async def upload_stream_to_folder(self, *, filename: str, open_stream, size_hint: Optional[int] = None) -> Optional[int]:
         """Upload the backup archive. Returns the id of the created file if known."""
         ONE_GIB = 900 * 1024 * 1024 # 900 MiB
@@ -300,14 +375,9 @@ class KDriveClient:
                         "directory_id": str(self._folder_id),
                         "file_name": filename,
                     }
-                    async with upload_session.post(url, headers=self._headers, params=params, data=await open_stream(), timeout=upload_timeout
-                    ) as resp:
-                        resp.raise_for_status()
-                        try:
-                            data = await resp.json()
-                        except Exception:
-                            data = {}
-                    uploaded_id = _extract_file_id(data)
+                    uploaded_id = await self._upload_direct(
+                        upload_session, url, params, filename, open_stream
+                    )
 
                 # ------------------------------------------------------------------
                 # 2b) Chunked upload if > 1 Go (900 MiB in reality)
@@ -384,10 +454,25 @@ class KDriveClient:
                             "chunk_size": len(chunk),
                             "chunk_hash": f"sha256:{chunk_hash}",
                         }
-                        async with upload_session.post(url, headers=self._headers, params=params, data=chunk
-                        ) as resp:
-                            resp.raise_for_status()
-                            data = await resp.json()
+                        for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+                            try:
+                                async with upload_session.post(
+                                    url, headers=self._headers, params=params, data=chunk,
+                                ) as resp:
+                                    resp.raise_for_status()
+                                    data = await resp.json()
+                                break
+                            except Exception as err:
+                                if not _is_retryable(err) or attempt == UPLOAD_ATTEMPTS:
+                                    raise
+                                delay = UPLOAD_RETRY_DELAYS[
+                                    min(attempt - 1, len(UPLOAD_RETRY_DELAYS) - 1)
+                                ]
+                                _LOGGER.warning(
+                                    "Chunk %d of %s failed (%s), retrying in %ss",
+                                    iteration, filename, err, delay,
+                                )
+                                await asyncio.sleep(delay)
                     
                     await self._io(_remove_spool, tmp_path)
                     tmp_path = None
